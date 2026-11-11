@@ -1,0 +1,182 @@
+#!/bin/bash
+# agent-awake: keep the display on while Claude Code or Codex is working,
+# so the Mac does not lock in the middle of a job.
+#
+# How it works
+#   Agent hooks call "beat" on every prompt and tool call. Each beat touches a
+#   small file per session. One background holder runs "caffeinate -d -i" for as
+#   long as any of those files is fresh. "end" (the Stop hook) removes the file.
+#   If an agent dies or gets interrupted without a Stop, its file goes stale
+#   after MAX_AGE seconds and the hold drops by itself.
+#
+# It changes no system setting. Lock on lid close and manual lock still work.
+#
+# Usage
+#   agent-awake beat <agent>   hook: mark the session as working (reads hook JSON on stdin)
+#   agent-awake end <agent>    hook: mark the session as done
+#   agent-awake status         show working sessions and whether the display is held
+#   agent-awake check          verify the hooks are wired (exit 0 in sync, 1 drift, 2 could not check)
+#   agent-awake off            drop the hold now and forget all sessions
+
+set -u
+
+DIR="${AGENT_AWAKE_DIR:-$HOME/.cache/agent-awake}"
+MAX_AGE="${AGENT_AWAKE_MAX_AGE:-1200}"   # seconds without a beat before a session counts as dead
+POLL="${AGENT_AWAKE_POLL:-15}"           # seconds between holder checks
+SESSIONS="$DIR/sessions"
+LOCK="$DIR/holder.lock"
+PIDFILE="$DIR/holder.pid"
+SELF="$0"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+
+mkdir -p "$SESSIONS" 2>/dev/null || exit 0
+
+# Session id from the hook JSON on stdin. Falls back to "default".
+#
+# Hook input can be megabytes (it carries the tool result), so this must not
+# read all of it: it stops at the first "session_id", which is the top-level
+# one, looks at 64 KB at most, and gives up after 2 seconds if stdin stays open.
+session_id() {
+  local id=""
+  if [ ! -t 0 ]; then
+    id=$(LC_ALL=C /usr/bin/perl -e '
+      alarm 2; my $b = "";
+      while (length($b) < 65536) {
+        my $n = sysread(STDIN, $b, 65536 - length($b), length($b));
+        last unless $n;
+        last if $b =~ /"session_id"\s*:\s*"[^"]*"/;
+      }
+      print $1 if $b =~ /"session_id"\s*:\s*"([^"]*)"/;
+    ' 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-80)
+  fi
+  printf '%s' "${id:-default}"
+}
+
+fresh_sessions() {
+  find "$SESSIONS" -type f -mtime "-${MAX_AGE}s" 2>/dev/null
+}
+
+# Is a holder running? The kernel lock is the truth: if we can take it, nobody
+# holds it. The pid file alone is never trusted (it survives a crash or reboot).
+lock_is_held() {
+  ! /usr/bin/lockf -k -s -t 0 "$LOCK" /usr/bin/true 2>/dev/null
+}
+
+holder_pid() {
+  local pid
+  lock_is_held || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [ -n "$pid" ] || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q 'agent-awake _hold$' || return 1
+  printf '%s' "$pid"
+}
+
+# Exactly one holder: lockf takes a kernel lock on $LOCK, and the kernel drops
+# it when the holder dies, so there is never a stale lock to clean up.
+#
+# A holder that is about to exit removes its pid file first and then looks for
+# sessions once more. So "no pid file" means "start one": the new holder waits
+# up to 5 seconds for the old one to let go of the lock.
+start_holder() {
+  [ -f "$PIDFILE" ] && lock_is_held && return 0
+  nohup /usr/bin/lockf -k -s -t 5 "$LOCK" "$SELF" _hold </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+cmd="${1:-status}"
+agent=$(printf '%s' "${2:-agent}" | LC_ALL=C tr -cd 'A-Za-z0-9._-')
+
+case "$cmd" in
+  beat)
+    touch "$SESSIONS/${agent}-$(session_id)" 2>/dev/null
+    start_holder
+    ;;
+
+  end)
+    rm -f "$SESSIONS/${agent}-$(session_id)" 2>/dev/null
+    ;;
+
+  _hold)
+    # Only ever runs under lockf (see start_holder), so there is one at a time.
+    caf=""
+    nap=""
+    trap '[ -n "$caf" ] && kill "$caf" 2>/dev/null; [ -n "$nap" ] && kill "$nap" 2>/dev/null; rm -f "$PIDFILE"' EXIT
+    trap 'exit 0' TERM INT HUP
+    while :; do
+      echo $$ > "$PIDFILE"
+      while [ -n "$(fresh_sessions)" ]; do
+        if [ -z "$caf" ] || ! kill -0 "$caf" 2>/dev/null; then
+          # 3>&- ...: do not hand the lock to children, or it would outlive a killed holder.
+          caffeinate -d -i -w $$ 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
+          caf=$!
+        fi
+        # Sleep in the background and wait for it, so a TERM is handled at once.
+        sleep "$POLL" 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
+        nap=$!
+        wait "$nap"
+      done
+      # Say "gone" first, then look once more. A beat that lands in between
+      # either gets seen here or finds no pid file and starts the next holder.
+      rm -f "$PIDFILE"
+      [ -n "$(fresh_sessions)" ] || break
+    done
+    find "$SESSIONS" -type f -mtime "+${MAX_AGE}s" -delete 2>/dev/null
+    ;;
+
+  off)
+    rm -f "$SESSIONS"/* 2>/dev/null
+    if pid=$(holder_pid); then
+      kill "$pid" 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+    echo "released"
+    ;;
+
+  status)
+    list=$(fresh_sessions)
+    if [ -n "$list" ]; then
+      echo "working sessions:"
+      printf '%s\n' "$list" | sed 's|.*/|  |'
+    else
+      echo "working sessions: none"
+    fi
+    if pid=$(holder_pid); then
+      echo "display held awake: yes (holder pid $pid)"
+    else
+      echo "display held awake: no"
+    fi
+    ;;
+
+  check)
+    rc=0
+    unknown() { echo "could not check: $1"; [ "$rc" -eq 1 ] || rc=2; }
+    check_file() { # name dir file needles...
+      local name="$1" dir="$2" file="$3"; shift 3
+      if [ ! -d "$dir" ]; then echo "skipped: $name (not on this machine)"; return; fi
+      if [ ! -r "$file" ]; then unknown "$name ($file not readable)"; return; fi
+      local n miss=""
+      for n in "$@"; do
+        grep -qF "agent-awake\\\" $n\"" "$file" || miss="$miss '$n'"
+      done
+      if [ -n "$miss" ]; then echo "drift: $name is missing$miss"; rc=1
+      else echo "in sync: $name"; fi
+    }
+    check_file "Claude Code hooks" "$CLAUDE_DIR" "$CLAUDE_DIR/settings.json" "beat claude" "end claude"
+    check_file "Codex hooks" "$CODEX_DIR" "$CODEX_DIR/hooks.json" "beat codex" "end codex"
+    if [ -x "$HOME/.local/bin/agent-awake" ]; then echo "in sync: command"
+    else echo "drift: $HOME/.local/bin/agent-awake is missing, the hooks point at it"; rc=1; fi
+    command -v caffeinate >/dev/null || unknown "caffeinate not found"
+    [ -x /usr/bin/lockf ] || unknown "/usr/bin/lockf not found"
+    exit "$rc"
+    ;;
+
+  *)
+    echo "usage: agent-awake {beat|end} <agent> | status | check | off" >&2
+    exit 64
+    ;;
+esac
+exit 0

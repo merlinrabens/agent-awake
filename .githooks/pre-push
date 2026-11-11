@@ -1,0 +1,3 @@
+#!/bin/bash
+# Do not push a version that fails its own tests.
+exec "$(git rev-parse --show-toplevel)/tests/run.sh"
