@@ -16,7 +16,7 @@ agent-awake holds the display on only while an agent is actually working. When t
 
 macOS only. Needs `python3` for the installer (comes with the Xcode command line tools).
 
-Tested on an Intel Mac with macOS 26, Claude Code 2.1 and Codex CLI 0.154. Nothing in it depends on the chip, but Apple Silicon has not been tested yet.
+Used daily on an Intel Mac with macOS 26, Claude Code 2.1 and Codex CLI 0.154. The test suite also runs on Apple Silicon in CI on every push.
 
 ```bash
 git clone https://github.com/merlinrabens/agent-awake.git ~/.agent-awake
